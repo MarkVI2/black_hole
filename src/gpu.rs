@@ -1,15 +1,14 @@
 use bytemuck::{Pod, Zeroable};
+use std::sync::mpsc;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct CameraUniform {
     pub eye: [f32; 3],
     pub _pad0: f32,
-    pub vp: [[f32; 4]; 4],
     pub inv_vp: [[f32; 4]; 4],
     pub screen_size: [f32; 2],
-    pub font_size: f32,
-    pub _pad1: f32,
+    pub _pad1: [f32; 2],
 }
 
 #[repr(C)]
@@ -18,11 +17,14 @@ pub struct SimParams {
     pub g: f32,
     pub bh_radius: f32,
     pub c_sim: f32,
-    pub photon_speed: f32,
-    pub step_size: f32,
-    pub gravity_bend_scale: f32,
     pub disk_inner: f32,
     pub disk_outer: f32,
+    // Pad to place light_pos at offset 48 (WGSL std140-like rules)
+    // 5*f32 (20 bytes) + 7*f32 (28 bytes) = 48 bytes
+    pub _pad_before_light: [f32; 7],
+    // vec3 + trailing pad f32 (shader packs this as vec3 + pad)
+    pub light_pos: [f32; 3],
+    pub _pad0: f32,
 }
 
 pub struct GpuContext {
@@ -38,23 +40,12 @@ impl GpuContext {
     pub async fn new() -> anyhow::Result<Self> {
         let instance = wgpu::Instance::default();
         let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
             .await
             .ok_or_else(|| anyhow::anyhow!("No GPU adapter found"))?;
 
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults(),
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor::default(), None)
             .await?;
 
         let shader_src = include_str!("shader.wgsl");
@@ -136,6 +127,15 @@ impl GpuContext {
     pub fn update_params(&self, params: &SimParams) {
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(params));
     }
+    
+    pub fn create_output_buffer(&self, width: u32, height: u32) -> wgpu::Buffer {
+        self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("output-buffer"),
+            size: (width * height * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        })
+    }
 
     pub fn dispatch(&self, out_buf: &wgpu::Buffer, width: u32, height: u32) -> wgpu::Buffer {
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -155,9 +155,9 @@ impl GpuContext {
             mapped_at_creation: false,
         });
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("encoder") });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("bh-pass"), timestamp_writes: None });
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             cpass.set_pipeline(&self.pipeline);
             cpass.set_bind_group(0, &bind, &[]);
             let wg_x = (width + 7) / 8;
@@ -169,25 +169,14 @@ impl GpuContext {
         staging
     }
 
-    pub fn create_output_buffer(&self, width: u32, height: u32) -> wgpu::Buffer {
-        self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("output-buffer"),
-            size: (width * height * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        })
-    }
-
     pub fn read_buffer_blocking(&self, staging: &wgpu::Buffer, size: usize) -> Vec<u8> {
-    // Manual map and copy
         let slice = staging.slice(..);
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (sender, receiver) = mpsc::sync_channel(1);
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = sender.send(res);
         });
-        // Poll device to drive mapping
         self.device.poll(wgpu::Maintain::Wait);
-        let _ = receiver.recv().unwrap().unwrap();
+        receiver.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();
         let mut out = vec![0u8; size];
         out.copy_from_slice(&data);
