@@ -19,12 +19,12 @@ pub struct SimParams {
     pub c_sim: f32,
     pub disk_inner: f32,
     pub disk_outer: f32,
-    // Pad to place light_pos at offset 48 (WGSL std140-like rules)
-    // 5*f32 (20 bytes) + 7*f32 (28 bytes) = 48 bytes
-    pub _pad_before_light: [f32; 7],
-    // vec3 + trailing pad f32 (shader packs this as vec3 + pad)
-    pub light_pos: [f32; 3],
-    pub _pad0: f32,
+    pub bh_mass: f32,
+    pub _pad_a: [f32; 2],
+    // Pack positions as vec4 for alignment; w is unused for light
+    pub light_pos: [f32; 4],
+    // planet xyz in xyz, mass in w
+    pub planet_pos_mass: [f32; 4],
 }
 
 pub struct GpuContext {

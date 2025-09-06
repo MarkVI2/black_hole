@@ -14,10 +14,10 @@ struct SimParams {
     c_sim: f32,
     disk_inner: f32,
     disk_outer: f32,
-    // align next vec3 on 16-byte boundary (matches Rust 7*f32 pad)
-    _pad_before_light: vec3<f32>,
-    light_pos: vec3<f32>,
-    _pad0: f32,
+    bh_mass: f32,
+    _pad_a: vec2<f32>,
+    light_pos: vec4<f32>,
+    planet_pos_mass: vec4<f32>,
 };
 
 // Bindings for the data buffers
@@ -42,103 +42,86 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     
     var dir = normalize(wp_far - cam.eye);
     var pos = cam.eye;
-    
-    var color = vec3<f32>(0.0);
-    var out_alpha: f32 = 0.0;
 
-    // 2. Ray Marching Loop
-    for (var i: u32 = 0u; i < 1200u; i = i + 1u) {
+    var accum = vec3<f32>(0.0);
+    var alpha = 0.0;
+
+    // Tilted disk plane (constant across ray)
+    let tilt = radians(3.0);
+    let n = normalize(vec3<f32>(sin(tilt), cos(tilt), 0.0));
+    let half_h = 10.0; // half thickness of disk volume
+
+    // 2. Ray Marching Loop (reduced steps + adaptive step length)
+    for (var i: u32 = 0u; i < 400u; i = i + 1u) { // Reduced from 600
         let to_bh = -pos;
         let dist_sq = max(1e-6, dot(to_bh, to_bh));
         if (dist_sq < sim.bh_radius * sim.bh_radius) {
-            color = vec3<f32>(0.0);
-            break;
+            accum = vec3<f32>(0.0); // Hit the event horizon, color is black
+            alpha = 1.0; // Make it opaque
+            break; 
         }
 
-        // Bend the ray's path with gravity
-        let r = sqrt(dist_sq);
-        let accel_mag = 1.8 * (sim.g * 9500.0) / dist_sq;
-        let accel = (to_bh / r) * accel_mag;
-        let dt = 2.0 / 260.0;
+        // Bend the ray's path with gravity (BH + planet) using inverse sqrt where possible
+        let rsq_bh = dist_sq;
+        let inv_r_bh = inverseSqrt(rsq_bh);
+        let accel_mag_bh = 1.8 * (sim.g * sim.bh_mass) / rsq_bh;
+        let accel_bh = to_bh * inv_r_bh * accel_mag_bh;
+        let to_pl = sim.planet_pos_mass.xyz - pos;
+        let rsq_pl = max(1e-6, dot(to_pl, to_pl));
+        let inv_r_pl = inverseSqrt(rsq_pl);
+        let accel_mag_pl = 1.8 * (sim.g * sim.planet_pos_mass.w) / rsq_pl;
+        let accel_pl = to_pl * inv_r_pl * accel_mag_pl;
+        let accel = accel_bh + accel_pl;
+        let dt = 2.0 / 200.0;
         dir = normalize(dir + accel * dt);
 
-        // Check for intersection with the accretion disk plane
-        let y0 = pos.y;
-        let y1 = pos.y + dir.y * 2.0;
-        if ((y0 > 0.0 && y1 <= 0.0) || (y0 < 0.0 && y1 >= 0.0)) {
-            let s = -y0 / dir.y;
-            if (s >= 0.0 && s <= 2.0) {
-                let p = pos + dir * s;
-                let r_hit = length(vec2<f32>(p.x, p.z));
-
-                // Make disk much thicker and add smoothing for a cloud effect
-                // Increase disk thickness by expanding the range and smoothing edges
-                let disk_thickness = 55.0;
-                let disk_fade = 30.0;
-                let disk_center = (sim.disk_inner + sim.disk_outer) * 0.5;
-                let disk_radius = (sim.disk_outer - sim.disk_inner) * 0.5;
-                let dist_to_center = abs(r_hit - disk_center);
-                let fade = smoothstep(disk_radius - disk_thickness, disk_radius + disk_thickness + disk_fade, dist_to_center);
-                if (r_hit > sim.disk_inner - disk_thickness && r_hit < sim.disk_outer + disk_thickness) {
-                    // 3. Shading and Doppler Effect (no shadow)
-                    var brightness = 0.35;
-                    let tangent = normalize(vec3<f32>(-p.z, 0.0, p.x));
-                    let v_k = sqrt((sim.g * 9500.0) / r_hit);
-                    let beta = min(v_k / sim.c_sim, 0.95);
-                    let gamma = 1.0 / sqrt(1.0 - beta * beta);
-                    let view_dir = normalize(cam.eye - p);
-                    let cos_theta = dot(tangent, view_dir);
-                    let doppler = 1.0 / (gamma * (1.0 - beta * cos_theta));
-                    brightness = brightness * pow(clamp(doppler, 0.4, 2.5), 3.0) * 1.4;
-
-                    // Smooth gradient between deep orange and yellow
-                    let deep_orange = vec3(1.0, 0.62, 0.12);
-                    let bright_yellow = vec3(1.0, 0.96, 0.55);
-                    let t = clamp((doppler - 0.7) / 1.2, 0.0, 1.0);
-                    let color_vec = mix(deep_orange, bright_yellow, smoothstep(0.0, 1.0, t));
-
-                    // Smooth fade, no pulse
-                    let smooth_alpha = 1.0 - fade;
-                    color = color_vec * clamp(brightness * smooth_alpha, 0.0, 1.0);
-                    out_alpha = 1.0;
-                    break;
-                }
+        // Volumetric sampling around tilted disk plane within a finite thickness
+        let d_plane = dot(n, pos);
+        if (abs(d_plane) < half_h) {
+            let radial = pos - n * d_plane;
+            let r_hit = length(radial.xz);
+            let edge_softness = 40.0;
+            let inner_soft = smoothstep(sim.disk_inner - edge_softness, sim.disk_inner + edge_softness, r_hit);
+            let outer_soft = 1.0 - smoothstep(sim.disk_outer - edge_softness, sim.disk_outer + edge_softness, r_hit);
+            let disk_mask = clamp(inner_soft * outer_soft, 0.0, 1.0);
+            if (disk_mask > 0.001) {
+                let h_t = 1.0 - clamp(abs(d_plane) / half_h, 0.0, 1.0);
+                let radial_dir = normalize(vec3<f32>(radial.x, radial.y, radial.z));
+                let tangent = normalize(cross(n, radial_dir));
+                let v_k = sqrt((sim.g * sim.bh_mass) / max(1e-5, r_hit));
+                let beta = min(v_k / sim.c_sim, 0.95);
+                let gamma = 1.0 / sqrt(1.0 - beta * beta);
+                let view_dir = normalize(cam.eye - pos);
+                let cos_theta = dot(tangent, view_dir);
+                let doppler = 1.0 / (gamma * (1.0 - beta * cos_theta));
+                var brightness = 0.98 * disk_mask * h_t; // slightly boosted baseline for visibility
+                brightness = brightness * clamp(doppler, 0.4, 2.5);
+                // Slightly warmer yellow bias near the BH
+                let col_yellow = vec3(1.0, 0.98, 0.38);
+                let col_orange = vec3(1.0, 0.55, 0.12);
+                let col_red    = vec3(1.0, 0.16, 0.08);
+                let t_dop = clamp((doppler - 0.6) / 1.2, 0.0, 1.0);
+                // Bias more toward yellow (about +12%)
+                let warm = mix(col_orange, col_yellow, clamp(t_dop + 0.12, 0.0, 1.0));
+                let t_rad = clamp((r_hit - sim.disk_inner) / max(1e-5, (sim.disk_outer - sim.disk_inner)), 0.0, 1.0);
+                let color_vec = mix(warm, col_red, sqrt(t_rad)); // cheaper than pow
+                // Higher per-step alpha for a denser, more opaque disk
+                let a = min(0.6, 0.12 * brightness);
+                let one_m_a = 1.0 - alpha;
+                accum += color_vec * a * one_m_a;
+                alpha += a * one_m_a;
             }
         }
-        pos = pos + dir * 2.0;
+        if (alpha > 0.995) { break; }
+        // Adaptive step: smaller near disk and near BH, larger farther away
+        let step_len = clamp(sqrt(dist_sq) / 100.0, 1.0, 5.0);
+        pos = pos + dir * step_len;
         if (length(pos) > 5000.0) { break; }
     }
 
-    // 4. Projected 3D grid in XZ plane (y=0), mostly at bottom of screen
-    let grid_spacing = 20.0;
-    let grid_thickness = 0.02;
-    var grid_alpha = 0.0;
-    let grid_color = vec3<f32>(0.5, 0.5, 0.7);
-    // Use the initial view ray (no bending) to intersect plane y=0
-    let ray_dir0 = normalize(wp_far - cam.eye);
-    let denom = ray_dir0.y;
-    if (abs(denom) > 1e-5) {
-        let t_plane = -cam.eye.y / denom;
-        if (t_plane > 0.0) {
-            let hit = cam.eye + ray_dir0 * t_plane;
-            // Only draw near the bottom of the screen
-            let ndcY = ndc_y; // from earlier
-            let bottom_factor = clamp((0.0 - ndcY) / 1.0, 0.0, 1.0);
-            let gx = abs(fract(hit.x / grid_spacing) - 0.5);
-            let gz = abs(fract(hit.z / grid_spacing) - 0.5);
-            if (gx < grid_thickness || gz < grid_thickness) {
-                grid_alpha = 0.7 * bottom_factor * (1.0 - out_alpha);
-                color = mix(color, grid_color, grid_alpha);
-                if (grid_alpha > out_alpha) {
-                    out_alpha = grid_alpha;
-                }
-            }
-        }
-    }
-
-    // 5. Write final color to the output buffer.
-    let rgba = vec4<f32>(color, out_alpha);
+    // 4. Write final color to the output buffer
+    let rgba = vec4<f32>(accum, alpha);
     let u = vec4<u32>(rgba * 255.0);
     let idx = gid.y * width + gid.x;
-    out_buf[idx] = (u.x & 0xFFu) | ((u.y & 0xFFu) << 8u) | ((u.z & 0xFFu) << 16u) | ((u.w & 0xFFu) << 24u);
+    out_buf[idx] = (u.x & 0xFFu) | ((u.y & 0xFFu) << 8u) | ((u.z & 0xFFu) << 16u) | (u32(alpha * 0.95 * 255.0) << 24u);
 }
